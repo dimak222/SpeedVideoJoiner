@@ -38,37 +38,39 @@ jobs:
               $suffix = $ver.Substring($base.Length)
               $build = 0
               if ($suffix -match 'b(\d+)') { $build = [int]$matches[1] }
-              $content = @"
-# UTF-8
-VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers=($major, $minor, $patch, $build),
-    mask=0x3f,
-    flags=0x0,
-    OS=0x4,
-    fileType=0x1,
-    subtype=0x0,
-    date=(0, 0)
-  ),
-  kids=[
-    StringFileInfo(
-      [
-        StringTable(
-          u'040904B0',
-          [
-            StringStruct(u'FileDescription', u'SpeedVideoJoiner'),
-            StringStruct(u'InternalName', u'SpeedVideoJoiner'),
-            StringStruct(u'ProductVersion', u'$tag'),
-            StringStruct(u'ProductName', u'SpeedVideoJoiner'),
-            StringStruct(u'LegalCopyright', u'(c) dimak222')
-          ]
-        )
-      ]
-    ),
-    VarFileInfo([VarStruct(u'Translation', [1049, 1033])])
-  ]
-)
-"@
+
+              $lines = @(
+                  "# UTF-8",
+                  "VSVersionInfo(",
+                  "  ffi=FixedFileInfo(",
+                  "    filevers=($major, $minor, $patch, $build),",
+                  "    mask=0x3f,",
+                  "    flags=0x0,",
+                  "    OS=0x4,",
+                  "    fileType=0x1,",
+                  "    subtype=0x0,",
+                  "    date=(0, 0)",
+                  "  ),",
+                  "  kids=[",
+                  "    StringFileInfo(",
+                  "      [",
+                  "        StringTable(",
+                  "          u'040904B0',",
+                  "          [",
+                  "            StringStruct(u'FileDescription', u'SpeedVideoJoiner'),",
+                  "            StringStruct(u'InternalName', u'SpeedVideoJoiner'),",
+                  "            StringStruct(u'ProductVersion', u'$tag'),",
+                  "            StringStruct(u'ProductName', u'SpeedVideoJoiner'),",
+                  "            StringStruct(u'LegalCopyright', u'(c) dimak222')",
+                  "          ]",
+                  "        )",
+                  "      ]",
+                  "    ),",
+                  "    VarFileInfo([VarStruct(u'Translation', [1049, 1033])])",
+                  "  ]",
+                  ")"
+              )
+              $content = $lines -join "`r`n"
               Set-Content -Path version_info.txt -Value $content -Encoding UTF8
           } else {
               Write-Error "Не удалось извлечь версию из тега $tag"
