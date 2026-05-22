@@ -9,11 +9,36 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение Node.js 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Определяем имя проекта (из названия репозитория) и главный скрипт
+      - name: Determine project name and main script
+        id: vars
+        shell: bash
+        run: |
+          PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+
+          # Автоматический поиск главного скрипта
+          if [ -f "$PROJECT_NAME.pyw" ]; then
+            MAIN="$PROJECT_NAME.pyw"
+          elif [ -f "main.pyw" ]; then
+            MAIN="main.pyw"
+          elif [ -f "$PROJECT_NAME.py" ]; then
+            MAIN="$PROJECT_NAME.py"
+          elif [ -f "main.py" ]; then
+            MAIN="main.py"
+          else
+            echo "Error: No main script found (searched $PROJECT_NAME.pyw, main.pyw, $PROJECT_NAME.py, main.py)"
+            exit 1
+          fi
+          echo "MAIN_SCRIPT=$MAIN" >> $GITHUB_ENV
 
       # ----- При ручном запуске пересоздаём последний тег -----
       - name: Recreate latest tag (manual run)
@@ -44,7 +69,7 @@ jobs:
           # Сохраняем имя тега для последующих шагов
           echo "RECREATED_TAG=$TAG" >> $GITHUB_ENV
 
-      # ----- Генерация version info -----
+      # ----- Генерация version info (динамическая) -----
       - name: Generate version info file
         shell: powershell
         run: |
@@ -55,6 +80,7 @@ jobs:
               $tag = "${{ github.ref_name }}"
           }
           Write-Host "Using tag: $tag"
+          $project = "$env:PROJECT_NAME"
           $ver = $tag -replace '^v', ''
           if ($ver -match '^(\d+\.\d+\.\d+)') {
               $base = $matches[1]
@@ -84,10 +110,10 @@ jobs:
                   "        StringTable(",
                   "          u'040904B0',",
                   "          [",
-                  "            StringStruct(u'FileDescription', u'SpeedVideoJoiner'),",
-                  "            StringStruct(u'InternalName', u'SpeedVideoJoiner'),",
+                  "            StringStruct(u'FileDescription', u'$project'),",
+                  "            StringStruct(u'InternalName', u'$project'),",
                   "            StringStruct(u'ProductVersion', u'$tag'),",
-                  "            StringStruct(u'ProductName', u'SpeedVideoJoiner'),",
+                  "            StringStruct(u'ProductName', u'$project'),",
                   "            StringStruct(u'LegalCopyright', u'(c) dimak222')",
                   "          ]",
                   "        )",
@@ -117,21 +143,25 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name SpeedVideoJoiner SpeedVideoJoiner.pyw
+          pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name ${{ env.PROJECT_NAME }} ${{ env.MAIN_SCRIPT }}
 
+      # ----- Релиз при обычном пуше тега -----
       - name: Upload EXE to release (tag push)
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SpeedVideoJoiner.exe
+          files: dist/${{ env.PROJECT_NAME }}.exe
+          name: ${{ env.PROJECT_NAME }} ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ----- Релиз при ручном запуске -----
       - name: Upload EXE to release (manual)
         if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SpeedVideoJoiner.exe
+          files: dist/${{ env.PROJECT_NAME }}.exe
           tag_name: ${{ env.RECREATED_TAG }}
+          name: ${{ env.PROJECT_NAME }} ${{ env.RECREATED_TAG }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
