@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение Node.js 20
+      PROJECT_NAME: ${{ github.event.repository.name }}  # имя репозитория
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -18,24 +19,21 @@ jobs:
           fetch-depth: 0
 
       # Определяем имя проекта (из названия репозитория) и главный скрипт
-      - name: Determine project name and main script
+      - name: Determine main script
         id: vars
         shell: bash
         run: |
-          PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
-          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
-
           # Автоматический поиск главного скрипта
-          if [ -f "$PROJECT_NAME.pyw" ]; then
-            MAIN="$PROJECT_NAME.pyw"
+          if [ -f "${{ env.PROJECT_NAME }}.pyw" ]; then
+            MAIN="${{ env.PROJECT_NAME }}.pyw"
           elif [ -f "main.pyw" ]; then
             MAIN="main.pyw"
-          elif [ -f "$PROJECT_NAME.py" ]; then
-            MAIN="$PROJECT_NAME.py"
+          elif [ -f "${{ env.PROJECT_NAME }}.py" ]; then
+            MAIN="${{ env.PROJECT_NAME }}.py"
           elif [ -f "main.py" ]; then
             MAIN="main.py"
           else
-            echo "Error: No main script found (searched $PROJECT_NAME.pyw, main.pyw, $PROJECT_NAME.py, main.py)"
+            echo "Error: No main script found"
             exit 1
           fi
           echo "MAIN_SCRIPT=$MAIN" >> $GITHUB_ENV
@@ -66,10 +64,9 @@ jobs:
           git fetch --tags
           git checkout "$TAG"
 
-          # Сохраняем имя тега для последующих шагов
           echo "RECREATED_TAG=$TAG" >> $GITHUB_ENV
 
-      # ----- Генерация version info (динамическая) -----
+      # ----- Генерация version info -----
       - name: Generate version info file
         shell: powershell
         run: |
@@ -80,7 +77,7 @@ jobs:
               $tag = "${{ github.ref_name }}"
           }
           Write-Host "Using tag: $tag"
-          $project = "$env:PROJECT_NAME"
+          $project = "${{ env.PROJECT_NAME }}"
           $ver = $tag -replace '^v', ''
           if ($ver -match '^(\d+\.\d+\.\d+)') {
               $base = $matches[1]
