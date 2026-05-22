@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия (например, v26.05.15)'
+        required: true
+        default: 'v26.05.0'
 
 jobs:
   build:
@@ -28,7 +33,13 @@ jobs:
       - name: Generate version info file
         shell: powershell
         run: |
-          $tag = "${{ github.ref_name }}"
+          # Определяем, откуда брать версию
+          if ("${{ github.event_name }}" -eq "push") {
+              $tag = "${{ github.ref_name }}"
+          } else {
+              $tag = "${{ github.event.inputs.version }}"
+          }
+
           $ver = $tag -replace '^v', ''
           if ($ver -match '^(\d+\.\d+\.\d+)') {
               $base = $matches[1]
