@@ -4,42 +4,48 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Версия (например, v26.05.15)'
-        required: true
-        default: 'v26.05.0'
+  workflow_dispatch:   # ручной запуск
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          fetch-depth: 0
 
-      - name: Install dependencies
+      # ----- При ручном запуске пересоздаём последний тег -----
+      - name: Recreate latest tag (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null)
+          if [ -z "$TAG" ]; then
+            echo "Нет ни одного тега. Создайте тег вручную."
+            exit 1
+          fi
+          echo "Последний тег: $TAG"
 
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git tag -d "$TAG" 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          git fetch --tags
+          git checkout "$TAG"
+
+      # ----- Генерация version info -----
       - name: Generate version info file
         shell: powershell
         run: |
-          # Определяем, откуда брать версию
-          if ("${{ github.event_name }}" -eq "push") {
-              $tag = "${{ github.ref_name }}"
-          } else {
-              $tag = "${{ github.event.inputs.version }}"
-          }
-
+          $tag = "${{ github.ref_name }}"
           $ver = $tag -replace '^v', ''
           if ($ver -match '^(\d+\.\d+\.\d+)') {
               $base = $matches[1]
@@ -89,10 +95,24 @@ jobs:
               exit 1
           }
 
+      # ----- Установка Python и зависимостей -----
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ----- Сборка EXE -----
       - name: Build EXE with PyInstaller
         run: |
           pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name SpeedVideoJoiner SpeedVideoJoiner.pyw
 
+      # ----- Загрузка в релиз -----
       - name: Upload EXE to release
         uses: softprops/action-gh-release@v2
         with:
