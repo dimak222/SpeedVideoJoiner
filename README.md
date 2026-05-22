@@ -13,4 +13,7 @@
 
 Для работы программы необходим установленный "FFmpeg", для обработки 360° видео - "MP4Box".
 
+<img width="1190" height="1380" alt="image" src="https://github.com/user-attachments/assets/60e67a26-b207-460b-beeb-2f571cb1f2c2" />
+
+
 P.S. Большая часть кода написанна с помощью вайб-кодинга.
