@@ -7,7 +7,7 @@
 #-------------------------------------------------------------------------------
 
 title = "SpeedVideoJoiner"
-ver = "v26.05.15"
+ver = "v26.06.0"
 
 #------------------------------Импорт модулей-----------------------------------
 
@@ -24,7 +24,7 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from updater import UpdateChecker # импортируем модуль обновления
+from updater import start_update_check # импортируем модуль обновления
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -35,7 +35,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSettings, QTimer, QEvent
 from PyQt6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent, QKeyEvent, QIcon
-
 
 # ----------------- Форматирование времени -----------------
 def format_duration(seconds: float) -> str:
@@ -77,14 +76,63 @@ def get_video_info(filepath):
         return 0.0, False
 
 def repair_video(input_path, output_path):
+    """
+    Пытается восстановить видеофайл несколькими способами:
+    1. Агрессивное перекопирование с игнорированием ошибок.
+    2. Переупаковка в Matroska (mkv) и обратно в mp4.
+    Возвращает True, если удалось, иначе False.
+    """
+    # Способ 1: агрессивное копирование
+    cmd1 = [
+        'ffmpeg', '-y',
+        '-fflags', '+genpts+igndts+discardcorrupt',
+        '-err_detect', 'ignore_err',
+        '-i', input_path,
+        '-c', 'copy',
+        '-max_interleave_delta', '0',
+        '-avoid_negative_ts', 'make_zero',
+        output_path
+    ]
     try:
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-i', input_path, '-c', 'copy', output_path],
-            capture_output=True, text=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        return result.returncode == 0
+        subprocess.run(cmd1, capture_output=True, text=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        # Проверим, что файл создался и не пустой
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
     except Exception:
-        return False
+        pass
+
+    # Способ 2: переупаковка в MKV и обратно (иногда помогает при повреждённом mp4)
+    tmp_mkv = output_path + ".tmp.mkv"
+    cmd2 = [
+        'ffmpeg', '-y',
+        '-fflags', '+genpts+igndts+discardcorrupt',
+        '-err_detect', 'ignore_err',
+        '-i', input_path,
+        '-c', 'copy',
+        '-f', 'matroska',
+        tmp_mkv
+    ]
+    try:
+        subprocess.run(cmd2, capture_output=True, text=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        if os.path.exists(tmp_mkv) and os.path.getsize(tmp_mkv) > 0:
+            # Конвертируем MKV обратно в MP4
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-i', tmp_mkv,
+                '-c', 'copy',
+                output_path
+            ], capture_output=True, text=True, timeout=30,
+               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            os.unlink(tmp_mkv)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return True
+    except Exception:
+        if os.path.exists(tmp_mkv):
+            os.unlink(tmp_mkv)
+
+    return False
 
 def check_encoder_support(codec_name):
     try:
@@ -189,7 +237,10 @@ class EncodeWorker(QObject):
                         self._process.wait()
 
     def run(self):
+
         self._start_time = time.time()
+        self._last_eta_str = None
+
         try:
             # 1. Сбор файлов
             self.status.emit("Сбор видеофайлов...")
@@ -522,29 +573,72 @@ class EncodeWorker(QObject):
                 )
 
                 time_pattern = re.compile(r'time=(\d+):(\d+):(\d+)\.(\d+)')
-                last_percent = 0.0
+                last_percent = -1.0
+                speed_samples = []           # (real_time, video_time)
+                last_real_time = None
+                last_video_time = None
+                prev_video_time = -1.0       # для монотонности
+
                 for line in self._process.stderr:
                     if self._is_canceled:
                         break
                     match = time_pattern.search(line)
                     if match and effective_duration > 0:
                         h, m, s, frac = match.groups()
-                        current_time = int(h)*3600 + int(m)*60 + int(s) + int(frac)/100.0
-                        percent = min(current_time / effective_duration * 100, 100.0)
-                        if percent != last_percent:
-                            self.progress.emit(percent)
+                        raw_video_time = int(h)*3600 + int(m)*60 + int(s) + int(frac)/100.0
+                        # Пропускаем, если время уменьшилось (немонотонность)
+                        if raw_video_time < prev_video_time:
+                            continue
+                        prev_video_time = raw_video_time
+                        current_video_time = raw_video_time
+                        percent = min(current_video_time / effective_duration * 100, 100.0)
+
+                        now_real = time.time()
+                        if last_real_time is not None and last_video_time is not None:
+                            dt_real = now_real - last_real_time
+                            dt_video = current_video_time - last_video_time
+                            if dt_real > 0 and dt_video > 0:
+                                speed_samples.append((now_real, current_video_time))
+                                # Окно анализа — 60 секунд
+                                while speed_samples and (now_real - speed_samples[0][0]) > 60:
+                                    speed_samples.pop(0)
+                        last_real_time = now_real
+                        last_video_time = current_video_time
+
+                        # Обновляем прогресс и ETA только при изменении процента
+                        if abs(percent - last_percent) >= 0.1 and percent >= last_percent:
                             last_percent = percent
-                            if percent > 0:
-                                elapsed_encode = time.time() - encode_start
-                                total_estimated = elapsed_encode / (percent / 100.0)
-                                remaining = total_estimated - elapsed_encode
-                                if remaining < 0:
-                                    remaining = 0
-                                self.eta_update.emit(
-                                    f"Осталось: {format_duration(remaining)} "
-                                    f"(прошло {format_duration(elapsed_encode)})")
+                            self.progress.emit(percent)
+
+                            # Расчёт ETA по средней скорости за окно
+                            if len(speed_samples) >= 2:
+                                first_real = speed_samples[0][0]
+                                first_video = speed_samples[0][1]
+                                last_real = speed_samples[-1][0]
+                                last_video = speed_samples[-1][1]
+                                window_real = last_real - first_real
+                                window_video = last_video - first_video
+                                if window_real > 0 and window_video > 0:
+                                    avg_speed = window_video / window_real
+                                    remaining_video = effective_duration - current_video_time
+                                    remaining_real = remaining_video / avg_speed if avg_speed > 0 else 0.0
+                                    if remaining_real < 0:
+                                        remaining_real = 0.0
+                                    elapsed = now_real - encode_start
+                                    self._last_eta_str = (
+                                        f"Осталось: {format_duration(remaining_real)} "
+                                        f"(прошло {format_duration(elapsed)})"
+                                    )
+                                    self.eta_update.emit(self._last_eta_str)
+                                else:
+                                    self.eta_update.emit("Осталось: …")
                             else:
-                                self.eta_update.emit("Осталось: …")
+                                if hasattr(self, '_last_eta_str') and self._last_eta_str:
+                                    self.eta_update.emit(self._last_eta_str)
+                                else:
+                                    elapsed = now_real - encode_start
+                                    self.eta_update.emit(f"Осталось: ....  (прошло {format_duration(elapsed)})")
+
                     if 'Error' in line or 'Invalid' in line:
                         self._error_lines.append(line.strip())
                         self.log.emit(line.strip(), True)
@@ -633,17 +727,13 @@ def get_args_for_ffmpeg(list_path, output_file, speed, target_fps, vcodec, quali
                     atempo_chain.append(f'atempo={s}')
                 filter_audio = ','.join(atempo_chain)
                 args += ['-filter:a', filter_audio]
-                args += [
-                    '-fflags', '+genpts+igndts',
-                    '-err_detect', 'ignore_err',
-                    '-analyzeduration', '100M',
-                    '-probesize', '100M'
-                ]
+
             else:
-                # Без ускорения просто копируем аудио с флагами совместимости
+                # Без ускорения просто копируем аудио
                 args += ['-c:a', 'copy']
         else:
             args += ['-an']
+
         args += ['-y', output_file]
         return args
 
@@ -1402,12 +1492,6 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
 
-    # Проверка обновлений
-    updater = UpdateChecker(ver, title)
-    if updater.check():
-        if updater.show_update_dialog(title, ver):
-            updater.download_and_install()
-
     if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Icon.Critical)
@@ -1423,4 +1507,7 @@ if __name__ == '__main__':
 
     window = MainWindow()
     window.show()
+
+    _update_thread = start_update_check(title, ver, window, log_callback=window.append_log) # проверка обновления
+
     sys.exit(app.exec())

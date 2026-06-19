@@ -10,19 +10,20 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      PROJECT_NAME: ${{ github.event.repository.name }}
-      EXTRA_COLLECT: "ffmpeg"   # модули с нестандартным именем пакета
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение Node.js 20
+      PROJECT_NAME: ${{ github.event.repository.name }}  # имя репозитория
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Определяем имя проекта (из названия репозитория) и главный скрипт
       - name: Determine main script
         id: vars
         shell: bash
         run: |
+          # Автоматический поиск главного скрипта
           if [ -f "${{ env.PROJECT_NAME }}.pyw" ]; then
             MAIN="${{ env.PROJECT_NAME }}.pyw"
           elif [ -f "main.pyw" ]; then
@@ -137,25 +138,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Generate PyInstaller collect flags
-        id: coll
-        shell: bash
-        run: |
-          COLLECT=""
-          if [ -f requirements.txt ]; then
-            pkgs=$(grep -oE '^[A-Za-z0-9._-]+' requirements.txt | sort -u)
-            for pkg in $pkgs; do
-              COLLECT="$COLLECT --collect-all $pkg"
-            done
-          fi
-          for extra in $EXTRA_COLLECT; do
-            COLLECT="$COLLECT --collect-all $extra"
-          done
-          echo "COLLECT_FLAGS=$COLLECT" >> $GITHUB_ENV
-
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name ${{ env.PROJECT_NAME }} ${{ env.COLLECT_FLAGS }} ${{ env.MAIN_SCRIPT }}
+          pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name ${{ env.PROJECT_NAME }} ${{ env.MAIN_SCRIPT }}
 
       # Релиз при пуше тега
       - name: Upload EXE to release (tag push)
