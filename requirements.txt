@@ -1,28 +1,5 @@
-import requests
-import os
-import sys
-import subprocess
-import ffmpeg-python
-import ffmpeg
-import tempfile
-import re
-import time
-import signal
-import glob
-import shutil
-import threading
-
-from packaging.version import Version
-import send2trash
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QLineEdit, QFileDialog, QProgressBar,
-    QDoubleSpinBox, QSpinBox, QMessageBox, QTextEdit, QGroupBox,
-    QComboBox, QSizePolicy, QListWidget, QAbstractItemView, QCheckBox,
-    QRadioButton, QButtonGroup, QDialog
-)
-from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSettings, QTimer, QEvent
-from PyQt6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent, QKeyEvent, QIcon
+PyQt6
+requests
+packaging
+send2trash
+ffmpeg-python

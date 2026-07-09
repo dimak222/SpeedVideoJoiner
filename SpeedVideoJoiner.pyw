@@ -7,7 +7,7 @@
 #-------------------------------------------------------------------------------
 
 title = "SpeedVideoJoiner"
-ver = "v26.06.0"
+ver = "v26.07.0"
 
 #------------------------------Импорт модулей-----------------------------------
 
@@ -23,6 +23,8 @@ import glob
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import send2trash
 
 from updater import start_update_check # импортируем модуль обновления
 
@@ -268,49 +270,24 @@ class EncodeWorker(QObject):
                     return
 
                 if os.path.isdir(source):
+                    # Простой обход – сортировку сделаем позже
                     all_paths = list(glob.iglob(os.path.join(source, '**', '*'), recursive=True))
-                    # Если сортировка по номеру - идём с конца
-                    if sort_by_number:
-                        all_paths = reversed(all_paths)
-
                     for full_path in all_paths:
-
                         if self._is_canceled:
                             self.finished.emit(False, "Отменено!")
                             return
-
                         if not os.path.isfile(full_path):
                             continue
-
                         ext = os.path.splitext(full_path)[1].lower()
                         if ext not in extensions:
                             continue
-
                         if first_ext is not None and ext != first_ext:
                             continue
-
                         full_path = os.path.normpath(full_path)
-
-                        if sort_by_number:
-                            # Извлекаем номер и проверяем условие
-                            fname = os.path.splitext(os.path.basename(full_path))[0]
-                            num = self.extract_last_number(fname)
-                            if last_num > 0 and num <= last_num:
-                                # Дошли до последнего обработанного - можно прервать обход
-                                # Но только если у нас нет других папок, которые ещё не обошли
-                                # Для простоты просто пропускаем
-                                continue
-                            if end_num is not None and num > end_num:
-                                continue
-                        # Дошли сюда - файл подходит
-
                         if full_path not in raw_files:
                             raw_files.append(full_path)
-
                             if first_ext is None:
                                 first_ext = ext
-
-                            # Оповещаем о прогрессе сбора
                             self.progress_collect.emit(len(raw_files))
 
                 elif os.path.isfile(source):
@@ -337,20 +314,111 @@ class EncodeWorker(QObject):
                 self.finished.emit(False, "Не найдено ни одного видеофайла.")
                 return
 
-            # Если был обратный обход - переворачиваем список для правильного порядка
+            # --- Фильтрация и сортировка по номеру, если нужно ---
             if sort_by_number:
-                raw_files.reverse()
+                def extract_num(path):
+                    name = os.path.splitext(os.path.basename(path))[0]
+                    num = self.extract_last_number(name)
+                    return num if num != -1 else -1
 
-            # Дальнейшая сортировка и фильтрация не нужны, т.к. уже отфильтровали при сборе
-            # Но для режима "По возрастанию" оставляем как есть
-            if not sort_by_number:
+                # Фильтруем по last_num и end_num, если заданы
+                if last_num > 0 or end_num is not None:
+                    filtered = []
+                    for f in raw_files:
+                        num = extract_num(f)
+                        if last_num > 0 and num <= last_num:
+                            continue
+                        if end_num is not None and num > end_num:
+                            continue
+                        filtered.append(f)
+                    raw_files = filtered
+                    if not raw_files:
+                        self.finished.emit(False, "После фильтрации по номеру не осталось файлов.")
+                        return
+
+                # Сортируем по возрастанию номера (или по имени для файлов без номера)
+                raw_files.sort(key=lambda p: (extract_num(p), p))
+
+            else:
+                # Обычная сортировка по имени
                 raw_files.sort()
+
+            # === Предварительная проверка целостности и предложение CHKDSK ===
+            broken_files = []
+
+            # Используем однопоточную проверку для определения битых файлов
+            for f in raw_files:
+                if self._is_canceled:
+                    self.finished.emit(False, "Отменено!")
+                    return
+                _, valid = get_video_info(f)
+                if not valid:
+                    broken_files.append(f)
+
+            if broken_files:
+                # Диалог запроса CHKDSK – показываем из рабочего потока,
+                # но с флагом WindowStaysOnTopHint, чтобы он был заметен.
+                msg = QMessageBox()
+                msg.setWindowTitle("Обнаружены битые файлы")
+                msg.setText(
+                    f"Найдено {len(broken_files)} повреждённых файлов.\n"
+                    "Возможна ошибка файловой системы.\n"
+                    "Запустить проверку диска (CHKDSK)?"
+                )
+                msg.setIcon(QMessageBox.Icon.Warning)
+                msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+                yes_btn = msg.addButton("Да", QMessageBox.ButtonRole.YesRole)
+                msg.exec()
+
+                if msg.clickedButton() == yes_btn:
+                    drives = set()
+                    for p in broken_files:
+                        drive = os.path.splitdrive(p)[0]
+                        if drive:
+                            drives.add(drive)
+                    for drive in drives:
+                        self.log.emit(f"Запуск CHKDSK {drive} /f ...", False)
+                        try:
+                            subprocess.run(
+                                ['chkdsk', drive, '/f'],
+                                check=False, timeout=300,
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                            )
+                        except Exception as e:
+                            self.log.emit(f"Ошибка CHKDSK: {e}", True)
+
+                    # Повторная проверка только тех файлов, что были битыми
+                    still_broken = []
+                    for f in broken_files:
+                        if self._is_canceled:
+                            self.finished.emit(False, "Отменено!")
+                            return
+                        _, valid2 = get_video_info(f)
+                        if valid2:
+                            self.log.emit(f"Файл исправлен после CHKDSK: {os.path.basename(f)}", False)
+                        else:
+                            still_broken.append(f)
+                    broken_files = still_broken
+                    if broken_files:
+                        self.log.emit(f"После CHKDSK остались повреждёнными: {len(broken_files)} файлов.", True)
+                else:
+                    self.log.emit("Проверка диска отменена. Битые файлы будут пропущены.", False)
 
             # === Проверка, все ли файлы 360° MP4 ===
             all_360 = all(
                 os.path.splitext(f)[1].lower() == '.mp4' and is_spherical_mp4(f)
                 for f in raw_files
             )
+
+            # Создаём выходную папку, если она не существует
+            out_dir = os.path.dirname(self.output_file)
+            if out_dir and not os.path.exists(out_dir):
+                try:
+                    os.makedirs(out_dir, exist_ok=True)
+                    self.log.emit(f"Создана папка: {out_dir}", False)
+                except Exception as e:
+                    self.finished.emit(False, f"Не удалось создать папку {out_dir}: {e}")
+                    return
 
             if all_360:
                 # Режим 360° – объединение через MP4Box
@@ -1487,6 +1555,38 @@ class MainWindow(QMainWindow):
         self.settings.setValue("dup_to_folder", int(self.dup_to_folder_check.isChecked()))
         super().closeEvent(event)
 
+# ---------- Очистка старого .old файла при запуске ----------
+def cleanup_old_backup():
+    """Удаляет предыдущий .old файл, оставшийся после обновления."""
+    old_path = sys.argv[0] + ".old"
+    if not os.path.exists(old_path):
+        return
+    try:
+        if send2trash:
+            send2trash.send2trash(old_path)
+        else:
+            os.remove(old_path)
+    except Exception:
+        pass
+
+# Колбэк перезапуска после успешного обновления
+def do_restart(new_exe_path):
+    """Запускает новый исполняемый файл и завершает текущий процесс."""
+    bat = create_update_bat(new_exe_path)
+    os.startfile(bat)
+    QTimer.singleShot(500, lambda: QApplication.quit())
+
+def create_update_bat(new_exe_path):
+    """Создаёт bat-файл в TEMP, который запустит новую версию после выхода из текущей."""
+    import tempfile
+    bat_path = os.path.join(tempfile.gettempdir(), f"{title}_update.bat")
+    with open(bat_path, "w") as f:
+        f.write(f"""@echo off
+timeout /t 2 /nobreak >nul
+start "" "{new_exe_path}"
+del "%~f0" & exit
+""")
+    return bat_path
 
 if __name__ == '__main__':
 
@@ -1508,6 +1608,13 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
 
-    _update_thread = start_update_check(title, ver, window, log_callback=window.append_log) # проверка обновления
+    _update_thread = start_update_check(
+        title, ver, window,
+        log_callback=window.append_log,   # логирование в главное окно
+        on_restart=do_restart             # функция перезапуска
+    )
 
-    sys.exit(app.exec())
+    # Удаляем старый .old файл, оставшийся от предыдущего обновления
+    cleanup_old_backup()
+
+    app.exec()

@@ -5,18 +5,33 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:   # ручной запуск
+    inputs:
+      version:
+        description: 'Версия для сборки (оставьте пустым для автоопределения последнего тега)'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write                # необходимо для push тегов и релизов
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение Node.js 20
       PROJECT_NAME: ${{ github.event.repository.name }}  # имя репозитория
     steps:
+   
+      - name: Git config (long paths + symlinks)
+        shell: bash
+        run: |
+          git config --global core.longpaths true
+          git config --global core.symlinks false
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+        env:
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # убирает предупреждение Node 20
 
       # Определяем имя проекта (из названия репозитория) и главный скрипт
       - name: Determine main script
@@ -38,19 +53,40 @@ jobs:
           fi
           echo "MAIN_SCRIPT=$MAIN" >> $GITHUB_ENV
 
-      # При ручном запуске пересоздаём последний тег
-      - name: Recreate latest tag (manual run)
+      # При ручном запуске: получаем версию (авто или из ввода)
+      - name: Set version for manual run
+        if: github.event_name == 'workflow_dispatch'
+        id: manual_ver
+        shell: bash
+        run: |
+          # Пытаемся найти последний тег по дате создания (committerdate)
+          LAST_TAG=$(git for-each-ref --sort=-creatordate --format '%(refname:strip=2)' refs/tags | grep -E '^v' | head -n 1)
+
+          if [ -n "$LAST_TAG" ]; then
+            echo "Найден последний тег: $LAST_TAG"
+            echo "MANUAL_VERSION=$LAST_TAG" >> $GITHUB_ENV
+          else
+            # Если тегов нет, используем значение из input
+            INPUT_VERSION="${{ github.event.inputs.version }}"
+            if [ -n "$INPUT_VERSION" ]; then
+              echo "Используем версию из поля ввода: $INPUT_VERSION"
+              echo "MANUAL_VERSION=$INPUT_VERSION" >> $GITHUB_ENV
+            else
+              echo "Error: Нет ни одного тега и не указана версия в поле ввода."
+              exit 1
+            fi
+          fi
+
+      # При ручном запуске создаём/пересоздаём тег с определённой версией
+      - name: Create or recreate tag (manual run)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
-          if [ -z "$TAG" ]; then
-            echo "В репозитории нет тегов. Создайте первый тег вручную (например, v1.0.0) и повторите."
-            exit 1
-          fi
-          echo "Последний тег: $TAG"
+          TAG="${{ env.MANUAL_VERSION }}"
+          echo "Используемый тег: $TAG"
+
 
           git config user.name "github-actions"
           git config user.email "actions@github.com"
@@ -70,11 +106,10 @@ jobs:
       - name: Generate version info file
         shell: powershell
         run: |
-          $envTag = "$env:RECREATED_TAG"
-          if ($envTag) {
-              $tag = $envTag
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+              "${{ env.MANUAL_VERSION }}"
           } else {
-              $tag = "${{ github.ref_name }}"
+              "${{ github.ref_name }}"
           }
           Write-Host "Using tag: $tag"
           $project = "${{ env.PROJECT_NAME }}"
@@ -140,7 +175,7 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --icon=icon.ico --version-file=version_info.txt --name ${{ env.PROJECT_NAME }} ${{ env.MAIN_SCRIPT }}
+          pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --version-file=version_info.txt --name ${{ env.PROJECT_NAME }} ${{ env.MAIN_SCRIPT }}
 
       # Релиз при пуше тега
       - name: Upload EXE to release (tag push)

@@ -1,12 +1,9 @@
 import requests
 import os
 import sys
-import time
-import subprocess
 from packaging.version import Version
-import send2trash
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QHBoxLayout,
+    QDialog, QVBoxLayout, QHBoxLayout,
     QProgressBar, QPushButton, QLabel, QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -79,6 +76,10 @@ class UpdateChecker:
                     return True
                 else:
                     self.log("Обновлений нет.")
+
+            elif resp.status_code == 404:
+                self.log("Репозиторий не найден!")
+
         except Exception as e:
             self.log(f"Ошибка проверки обновлений: {e}")
         return False
@@ -92,7 +93,7 @@ class UpdateChecker:
                          "Скачать и установить обновление?")
             msg.setIcon(QMessageBox.Icon.Information)
             yes_btn = msg.addButton("Да", QMessageBox.ButtonRole.YesRole)
-            no_btn = msg.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+            msg.addButton("Нет", QMessageBox.ButtonRole.NoRole)
             msg.setDefaultButton(yes_btn)
 
             icon_path = os.path.join(os.path.dirname(sys.argv[0]), "icon.ico")
@@ -108,7 +109,7 @@ class UpdateChecker:
             return False
 
     # ================== Метод установки обновления ==================
-    def download_and_install(self, parent=None):
+    def download_and_install(self, parent=None, on_restart=None):
         exe_asset = None
         for asset in self.assets:
             if asset["name"].endswith(".exe"):
@@ -117,7 +118,7 @@ class UpdateChecker:
         if not exe_asset:
             self.log("Ошибка: EXE-файл не найден в релизе.")
             err_msg = QMessageBox(parent)
-            err_msg.setWindowTitle("Ошибка")
+            err_msg.setWindowTitle(f"{self.title} {self.current}")
             err_msg.setText("Не найден исполняемый файл в релизе.")
             err_msg.setIcon(QMessageBox.Icon.Warning)
             if parent is None:
@@ -130,6 +131,7 @@ class UpdateChecker:
         dir_name = os.path.dirname(old_exe)
         ext = os.path.splitext(old_exe)[1].lower()
 
+        # Временное имя для загружаемого файла
         if ext in ('.py', '.pyw'):
             target_exe = os.path.join(dir_name, f"{self.title}.exe")
         else:
@@ -178,7 +180,7 @@ class UpdateChecker:
             nonlocal cancel_done, download_started
             if cancel_done:
                 return
-            cancel_done = True
+            cancel_done = False
             download_started = True
             if timer is not None:
                 timer.stop()
@@ -226,7 +228,7 @@ class UpdateChecker:
 
                 # Предупреждение автоматически закроется через 5 секунд
                 warn = QMessageBox(dlg)
-                warn.setWindowTitle("Превышено время ожидания")
+                warn.setWindowTitle(f"{self.title} {self.current}")
                 warn.setText("Не удалось начать загрузку в течение 10 секунд.")
                 warn.setIcon(QMessageBox.Icon.Warning)
                 warn.setStandardButtons(QMessageBox.StandardButton.Ok)
@@ -251,34 +253,32 @@ class UpdateChecker:
         # После закрытия диалога только убедимся, что поток прерван
         # Никаких ожиданий – всё происходит мгновенно
         if thread.isRunning():
-            thread.requestInterruption()
+            thread.requestInterruption() # запрос остановки потока
 
         # Если загрузка успешно завершилась (файл есть и не было отмены)
-        if os.path.exists(target_exe) and not thread.isInterruptionRequested():
-            self.log("Установка обновления...")
-            if ext in ('.py', '.pyw'):
-                subprocess.Popen([target_exe])
-                time.sleep(0.5)
-                QApplication.quit()
-            else:
-                old_backup = old_exe + ".old"
-                if os.path.exists(old_backup):
-                    os.remove(old_backup)
-                os.rename(old_exe, old_backup)
-                os.rename(target_exe, old_exe)
-                subprocess.Popen([old_exe])
-                time.sleep(0.5)
-                try:
-                    send2trash.send2trash(old_backup)
-                except ImportError:
-                    try:
+        if os.path.exists(target_exe) and not cancel_done:
+            self.log("Обновление готово к установке.")
+            if on_restart:
+                # Для .py/.pyw – просто передаём target_exe
+                if ext in ('.py', '.pyw'):
+                    on_restart(target_exe)
+                else:
+                    # Для .exe: переименовываем текущий в .old, загруженный в старый
+                    old_backup = old_exe + ".old"
+                    if os.path.exists(old_backup):
                         os.remove(old_backup)
-                    except Exception:
-                        pass
-                QApplication.quit()
+                    os.rename(old_exe, old_backup)
+                    os.rename(target_exe, old_exe)
+
+                    # Передаём путь к готовому exe (теперь old_exe)
+                    on_restart(old_exe)
+
+            return
+
         else:
             # Отмена или ошибка — файл уже удалён внутри потока или в error-обработчике
             # Дополнительно подчищаем, если файл остался (параноидальная защита)
+            print("Обновление отменено или ошибка обновления!")
             try:
                 if os.path.exists(target_exe):
                     os.unlink(target_exe)
@@ -305,15 +305,13 @@ class UpdateCheckThread(QThread):
             pass
 
 
-def start_update_check(app_title, app_ver, parent_widget, log_callback=None):
+def start_update_check(app_title, app_ver, parent_widget, log_callback=None, on_restart=None):
     """
     Запускает фоновую проверку обновлений.
     При обнаружении новой версии автоматически показывает диалог
     (модально относительно parent_widget) и запускает установку.
 
-    log_callback – функция для вывода сообщений в лог программы.
-                     Может принимать один аргумент (строку) или
-                     несколько (напр. window.append_log(msg, is_error, show_time)).
+    on_restart(new_exe_path) – вызывается, когда всё готово, с путём к новому исполняемому файлу.
     """
     # Оборачиваем переданный колбэк, чтобы гарантированно вызывать с одним аргументом
     def safe_log(msg):
@@ -332,7 +330,7 @@ def start_update_check(app_title, app_ver, parent_widget, log_callback=None):
     def on_available(updater):
         try:
             if updater.show_update_dialog(app_title, app_ver, parent=parent_widget):
-                updater.download_and_install(parent=parent_widget)
+                updater.download_and_install(parent=parent_widget, on_restart=on_restart)
             else:
                 safe_log("Обновление отменено пользователем.")
         except Exception:
