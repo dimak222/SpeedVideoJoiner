@@ -7,7 +7,7 @@
 #-------------------------------------------------------------------------------
 
 title = "SpeedVideoJoiner"
-ver = "v26.07.0"
+ver = "v26.07.1"
 
 #------------------------------Импорт модулей-----------------------------------
 
@@ -359,7 +359,7 @@ class EncodeWorker(QObject):
                 # Диалог запроса CHKDSK – показываем из рабочего потока,
                 # но с флагом WindowStaysOnTopHint, чтобы он был заметен.
                 msg = QMessageBox()
-                msg.setWindowTitle("Обнаружены битые файлы")
+                msg.setWindowTitle(f"{title} {ver}")
                 msg.setText(
                     f"Найдено {len(broken_files)} повреждённых файлов.\n"
                     "Возможна ошибка файловой системы.\n"
@@ -982,8 +982,6 @@ class MainWindow(QMainWindow):
         self._show_eta = False
         self._ignore_worker_signals = False
 
-
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -1572,43 +1570,67 @@ def cleanup_old_backup():
 # Колбэк перезапуска после успешного обновления
 def do_restart(new_exe_path):
     """Запускает новый исполняемый файл и завершает текущий процесс."""
-    bat = create_update_bat(new_exe_path)
-    os.startfile(bat)
+    launch_new_version(new_exe_path)
     QTimer.singleShot(500, lambda: QApplication.quit())
 
-def create_update_bat(new_exe_path):
-    """Создаёт bat-файл в TEMP, который запустит новую версию после выхода из текущей."""
-    import tempfile
-    bat_path = os.path.join(tempfile.gettempdir(), f"{title}_update.bat")
-    with open(bat_path, "w") as f:
-        f.write(f"""@echo off
-timeout /t 2 /nobreak >nul
-start "" "{new_exe_path}"
-del "%~f0" & exit
-""")
-    return bat_path
+# ---------- Функция запуска новой версии после обновления ----------
+def launch_new_version(exe_path):
+    """Запускает переданный EXE-файл с очищенным окружением (без _MEI путей)."""
+    env = {}
+    for key in ('SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'PROGRAMDATA'):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    path = os.environ.get('PATH', '')
+    clean_path = [p for p in path.split(os.pathsep) if '_MEI' not in p]
+    env['PATH'] = os.pathsep.join(clean_path)
+
+    subprocess.Popen(
+        [exe_path],
+        env=env,
+        creationflags=subprocess.DETACHED_PROCESS,
+        close_fds=True
+    )
+
+# ---------- Показ сообщения (с настраиваемым текстом) ----------
+def message(text="Ошибка!", timeout=4, parent=None):
+
+    """
+    Показывает модальное окно с предупреждением.
+    text – произвольный текст сообщения.
+    Если timeout > 0, окно автоматически закроется через указанное число секунд.
+    parent – родительский виджет (можно None).
+    """
+    msg = QMessageBox(parent)
+    msg.setWindowTitle(f"{title} {ver}")
+    msg.setText(text)
+    msg.setIcon(QMessageBox.Icon.Critical)
+    if os.path.exists(icon_path):
+        msg.setWindowIcon(QIcon(icon_path))
+    if timeout > 0:
+        QTimer.singleShot(timeout * 1000, msg.close)
+    msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+    msg.exec()
 
 if __name__ == '__main__':
 
     app = QApplication(sys.argv)
 
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+
     if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Icon.Critical)
-        msg.setWindowTitle(f"{title} {ver}")
-        msg.setText("FFmpeg или FFprobe не найдены.\n\n"
-                     "Команда для Power Shell:\n"
-                     "\"winget install ffmpeg\"\n\n"
-                     "и перезапустите программу.")
-        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        QTimer.singleShot(10000, msg.close)
-        msg.exec()
-        sys.exit(1)
+        message(
+            "FFmpeg или FFprobe не найдены.\n\n"
+            "Команда для Power Shell:\n"
+            "\"winget install ffmpeg\"\n\n"
+            "и перезапустите программу.",
+            timeout=10,
+        )
+        sys.exit()
 
     window = MainWindow()
     window.show()
 
-    _update_thread = start_update_check(
+    update_thread = start_update_check(
         title, ver, window,
         log_callback=window.append_log,   # логирование в главное окно
         on_restart=do_restart             # функция перезапуска
