@@ -264,14 +264,24 @@ class EncodeWorker(QObject):
                 except ValueError:
                     end_num = None
 
+            # Вспомогательная функция извлечения номера (для сортировки и фильтрации)
+            def extract_num(path):
+                name = os.path.splitext(os.path.basename(path))[0]
+                num = self.extract_last_number(name)
+                return num if num != -1 else -1
+
             for source in self.sources:
                 if self._is_canceled:
                     self.finished.emit(False, "Отменено!")
                     return
 
                 if os.path.isdir(source):
-                    # Простой обход – сортировку сделаем позже
                     all_paths = list(glob.iglob(os.path.join(source, '**', '*'), recursive=True))
+
+                    # Если сортировка по номеру - идём с конца что бы быстрее показать найденые файлы
+                    if sort_by_number:
+                        all_paths = reversed(all_paths)
+
                     for full_path in all_paths:
                         if self._is_canceled:
                             self.finished.emit(False, "Отменено!")
@@ -284,6 +294,15 @@ class EncodeWorker(QObject):
                         if first_ext is not None and ext != first_ext:
                             continue
                         full_path = os.path.normpath(full_path)
+
+                        # Фильтрация по номеру прямо здесь
+                        if sort_by_number and (last_num > 0 or end_num is not None):
+                            num = extract_num(full_path)
+                            if last_num > 0 and num <= last_num:
+                                continue
+                            if end_num is not None and num > end_num:
+                                continue
+
                         if full_path not in raw_files:
                             raw_files.append(full_path)
                             if first_ext is None:
@@ -297,6 +316,15 @@ class EncodeWorker(QObject):
                         continue
                     if first_ext is not None and ext != first_ext:
                         continue
+
+                    # Фильтрация по номеру для одиночных файлов
+                    if sort_by_number and (last_num > 0 or end_num is not None):
+                        num = extract_num(full_path)
+                        if last_num > 0 and num <= last_num:
+                            continue
+                        if end_num is not None and num > end_num:
+                            continue
+
                     if full_path not in raw_files:
                         raw_files.append(full_path)
                         if first_ext is None:
@@ -314,33 +342,11 @@ class EncodeWorker(QObject):
                 self.finished.emit(False, "Не найдено ни одного видеофайла.")
                 return
 
-            # --- Фильтрация и сортировка по номеру, если нужно ---
+            # --- Сортировка (без повторной фильтрации) ---
             if sort_by_number:
-                def extract_num(path):
-                    name = os.path.splitext(os.path.basename(path))[0]
-                    num = self.extract_last_number(name)
-                    return num if num != -1 else -1
-
-                # Фильтруем по last_num и end_num, если заданы
-                if last_num > 0 or end_num is not None:
-                    filtered = []
-                    for f in raw_files:
-                        num = extract_num(f)
-                        if last_num > 0 and num <= last_num:
-                            continue
-                        if end_num is not None and num > end_num:
-                            continue
-                        filtered.append(f)
-                    raw_files = filtered
-                    if not raw_files:
-                        self.finished.emit(False, "После фильтрации по номеру не осталось файлов.")
-                        return
-
-                # Сортируем по возрастанию номера (или по имени для файлов без номера)
+                # Сортируем по возрастанию номера (файлы без номера – в начале)
                 raw_files.sort(key=lambda p: (extract_num(p), p))
-
             else:
-                # Обычная сортировка по имени
                 raw_files.sort()
 
             # === Предварительная проверка целостности и предложение CHKDSK ===
