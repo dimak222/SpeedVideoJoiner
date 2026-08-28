@@ -7,14 +7,13 @@
 #-------------------------------------------------------------------------------
 
 title = "SpeedVideoJoiner"
-ver = "v26.07.2"
+ver = "v26.08.0"
 
 #------------------------------Импорт модулей-----------------------------------
 
 import os
 import sys
 import subprocess
-import ffmpeg
 import tempfile
 import re
 import time
@@ -38,134 +37,291 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSettings, QTimer, QEvent
 from PyQt6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent, QKeyEvent, QIcon
 
-# ----------------- Форматирование времени -----------------
-def format_duration(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    total_secs = int(seconds)
-    hours, remainder = divmod(total_secs, 3600)
-    minutes, secs = divmod(remainder, 60)
-    parts = []
-    if hours > 0:
-        parts.append(f"{hours} ч")
-    if minutes > 0 or hours > 0:
-        parts.append(f"{minutes} мин")
-    parts.append(f"{secs} сек")
-    return " ".join(parts)
+#-------------------------------------------------------------------------------
 
+# ---------- Общие функции приложения: обновление, запуск, сообщения -----------
+class Application:
+    """Общие функции приложения: обновление, запуск, сообщения."""
 
-def time_stamp() -> str:
-    """Возвращает текущее время в формате HHMMSS."""
-    t = time.localtime()
-    return f"{t.tm_hour:02d}{t.tm_min:02d}{t.tm_sec:02d}"
+    @staticmethod
+    def cleanup_old_backup():
+        """Удаляет предыдущий .old файл, оставшийся после обновления."""
+        old_path = sys.argv[0] + ".old"
+        if not os.path.exists(old_path):
+            return
+        try:
+            if send2trash:
+                send2trash.send2trash(old_path)
+            else:
+                os.remove(old_path)
+        except Exception:
+            pass
 
+    @staticmethod
+    def do_restart(new_exe_path):
+        """Запускает новый исполняемый файл и завершает текущий процесс."""
+        Application.launch_new_version(new_exe_path)
+        QTimer.singleShot(500, lambda: QApplication.quit())
 
-# ----------------- Проверки -----------------
+    @staticmethod
+    def launch_new_version(exe_path):
+        """Запускает переданный EXE-файл с очищенным окружением (без _MEI путей)."""
+        env = {}
+        for key in ('SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'PROGRAMDATA'):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        path = os.environ.get('PATH', '')
+        clean_path = [p for p in path.split(os.pathsep) if '_MEI' not in p]
+        env['PATH'] = os.pathsep.join(clean_path)
 
-def get_video_info(filepath):
-    """Возвращает (длительность, is_valid) одним вызовом ffprobe."""
-    try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', filepath],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip()), True
-        else:
+        subprocess.Popen(
+            [exe_path],
+            env=env,
+            creationflags=subprocess.DETACHED_PROCESS,
+            close_fds=True
+        )
+
+    @staticmethod
+    def message(text="Ошибка!", timeout=4, parent=None):
+        """
+        Показывает модальное окно с предупреждением.
+        text – произвольный текст сообщения.
+        Если timeout > 0, окно автоматически закроется через указанное число секунд.
+        parent – родительский виджет (можно None).
+        """
+        msg = QMessageBox(parent)
+        msg.setWindowTitle(f"{title} {ver}")
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Icon.Critical)
+        if os.path.exists(icon_path):
+            msg.setWindowIcon(QIcon(icon_path))
+        if timeout > 0:
+            QTimer.singleShot(timeout * 1000, msg.close)
+        msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        msg.exec()
+
+# ----------------- Вспомогательные функции для работы с видео -----------------
+class VideoTools:
+    """Вспомогательные функции для работы с видео."""
+
+    @staticmethod
+    def get_video_info(filepath):
+        """Возвращает (длительность, is_valid) одним вызовом ffprobe."""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', filepath],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            if result.returncode == 0 and result.stdout.strip():
+                return float(result.stdout.strip()), True
+            else:
+                return 0.0, False
+        except Exception:
             return 0.0, False
-    except Exception:
-        return 0.0, False
 
-def repair_video(input_path, output_path):
-    """
-    Пытается восстановить видеофайл несколькими способами:
-    1. Агрессивное перекопирование с игнорированием ошибок.
-    2. Переупаковка в Matroska (mkv) и обратно в mp4.
-    Возвращает True, если удалось, иначе False.
-    """
-    # Способ 1: агрессивное копирование
-    cmd1 = [
-        'ffmpeg', '-y',
-        '-fflags', '+genpts+igndts+discardcorrupt',
-        '-err_detect', 'ignore_err',
-        '-i', input_path,
-        '-c', 'copy',
-        '-max_interleave_delta', '0',
-        '-avoid_negative_ts', 'make_zero',
-        output_path
-    ]
-    try:
-        subprocess.run(cmd1, capture_output=True, text=True, timeout=30,
-                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        # Проверим, что файл создался и не пустой
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return True
-    except Exception:
-        pass
-
-    # Способ 2: переупаковка в MKV и обратно (иногда помогает при повреждённом mp4)
-    tmp_mkv = output_path + ".tmp.mkv"
-    cmd2 = [
-        'ffmpeg', '-y',
-        '-fflags', '+genpts+igndts+discardcorrupt',
-        '-err_detect', 'ignore_err',
-        '-i', input_path,
-        '-c', 'copy',
-        '-f', 'matroska',
-        tmp_mkv
-    ]
-    try:
-        subprocess.run(cmd2, capture_output=True, text=True, timeout=30,
-                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        if os.path.exists(tmp_mkv) and os.path.getsize(tmp_mkv) > 0:
-            # Конвертируем MKV обратно в MP4
-            subprocess.run([
-                'ffmpeg', '-y',
-                '-i', tmp_mkv,
-                '-c', 'copy',
-                output_path
-            ], capture_output=True, text=True, timeout=30,
-               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            os.unlink(tmp_mkv)
+    @staticmethod
+    def repair_video(input_path, output_path):
+        """
+        Пытается восстановить видеофайл несколькими способами:
+        1. Агрессивное перекопирование с игнорированием ошибок.
+        2. Переупаковка в Matroska (mkv) и обратно в mp4.
+        Возвращает True, если удалось, иначе False.
+        """
+        # Способ 1: агрессивное копирование
+        cmd1 = [
+            'ffmpeg', '-y',
+            '-fflags', '+genpts+igndts+discardcorrupt',
+            '-err_detect', 'ignore_err',
+            '-i', input_path,
+            '-c', 'copy',
+            '-max_interleave_delta', '0',
+            '-avoid_negative_ts', 'make_zero',
+            output_path
+        ]
+        try:
+            subprocess.run(cmd1, capture_output=True, text=True, timeout=30,
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            # Проверим, что файл создался и не пустой
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 return True
-    except Exception:
-        if os.path.exists(tmp_mkv):
-            os.unlink(tmp_mkv)
+        except Exception:
+            pass
 
-    return False
+        # Способ 2: переупаковка в MKV и обратно (иногда помогает при повреждённом mp4)
+        tmp_mkv = output_path + ".tmp.mkv"
+        cmd2 = [
+            'ffmpeg', '-y',
+            '-fflags', '+genpts+igndts+discardcorrupt',
+            '-err_detect', 'ignore_err',
+            '-i', input_path,
+            '-c', 'copy',
+            '-f', 'matroska',
+            tmp_mkv
+        ]
+        try:
+            subprocess.run(cmd2, capture_output=True, text=True, timeout=30,
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            if os.path.exists(tmp_mkv) and os.path.getsize(tmp_mkv) > 0:
+                # Конвертируем MKV обратно в MP4
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-i', tmp_mkv,
+                    '-c', 'copy',
+                    output_path
+                ], capture_output=True, text=True, timeout=30,
+                   creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+                os.unlink(tmp_mkv)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    return True
+        except Exception:
+            if os.path.exists(tmp_mkv):
+                os.unlink(tmp_mkv)
 
-def check_encoder_support(codec_name):
-    try:
-        result = subprocess.run(
-            ['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        return codec_name in result.stdout
-    except Exception:
         return False
 
-def is_spherical_mp4(filepath):
-    """Проверяет, содержит ли MP4‑файл сферические side‑data (Spherical Mapping)."""
-    try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'stream_side_data',
-             '-of', 'json', filepath],
-            capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        return 'Spherical Mapping' in result.stdout
-    except Exception:
-        return False
+    @staticmethod
+    def check_encoder_support(codec_name):
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            return codec_name in result.stdout
+        except Exception:
+            return False
 
-def get_mp4box_path():
-    """Возвращает путь к mp4box.exe или None."""
-    path = shutil.which("mp4box")
-    if path:
-        return path
-    for p in [r"C:\Program Files\GPAC\mp4box.exe", r"C:\GPAC\mp4box.exe"]:
-        if os.path.exists(p):
-            return p
-    return None
+    @staticmethod
+    def is_spherical_mp4(filepath):
+        """Проверяет, содержит ли MP4‑файл сферические side‑data (Spherical Mapping)."""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'stream_side_data',
+                 '-of', 'json', filepath],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            return 'Spherical Mapping' in result.stdout
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_mp4box_path():
+        """Возвращает путь к mp4box.exe или None."""
+        path = shutil.which("mp4box")
+        if path:
+            return path
+        for p in [r"C:\Program Files\GPAC\mp4box.exe", r"C:\GPAC\mp4box.exe"]:
+            if os.path.exists(p):
+                return p
+        return None
+
+    @staticmethod
+    def _build_concat_args(list_path, output_file, speed, include_audio):
+        """
+        Собирает аргументы для ffmpeg в режиме копирования (без перекодировки видео).
+        Поддерживает ускорение через -itsscale и фильтр atempo для аудио.
+        """
+        args = ['ffmpeg', '-y']
+        if speed != 1.0:
+            args += ['-itsscale', str(1.0 / speed)]
+        args += ['-f', 'concat', '-safe', '0', '-i', list_path]
+        args += ['-c:v', 'copy']
+        if include_audio:
+            if speed != 1.0:
+                # При ускорении аудио перекодируем в AAC с фильтром atempo
+                args += ['-c:a', 'aac']
+                atempo_chain = []
+                s = speed
+                while s > 2.0:
+                    atempo_chain.append('atempo=2.0')
+                    s /= 2.0
+                while s < 0.5:
+                    atempo_chain.append('atempo=0.5')
+                    s /= 0.5
+                if s != 1.0:
+                    atempo_chain.append(f'atempo={s}')
+                filter_audio = ','.join(atempo_chain)
+                args += ['-filter:a', filter_audio]
+            else:
+                # Без ускорения копируем аудио
+                args += ['-c:a', 'copy']
+        else:
+            args += ['-an']
+        # Убрано дублирование -y, он уже есть в начале
+        args.append(output_file)
+        return args
+
+    @staticmethod
+    def _build_encode_args(list_path, output_file, speed, target_fps, vcodec, quality, preset, include_audio):
+        """
+        Собирает аргументы для ffmpeg с перекодировкой видео и аудио.
+        Применяет фильтры setpts (видео) и atempo (аудио, если включено),
+        только если скорость отличается от 1.0.
+        """
+        args = ['ffmpeg', '-y']
+        args += ['-f', 'concat', '-safe', '0', '-i', list_path]
+
+        # Фильтры
+        video_filter = f"setpts={1/speed}*PTS"
+        audio_filter_parts = []
+        if include_audio:
+            s = speed
+            while s > 2.0:
+                audio_filter_parts.append('atempo=2.0')
+                s /= 2.0
+            while s < 0.5:
+                audio_filter_parts.append('atempo=0.5')
+                s /= 0.5
+            if s != 1.0:
+                audio_filter_parts.append(f'atempo={s}')
+
+        # Применяем фильтры только если скорость != 1.0
+        if speed != 1.0:
+            if audio_filter_parts:
+                audio_filter = ','.join(audio_filter_parts)
+                args += ['-filter_complex', f'[0:v]{video_filter}[v];[0:a]{audio_filter}[a]']
+                args += ['-map', '[v]', '-map', '[a]']
+            else:
+                args += ['-filter:v', video_filter, '-map', '0:v']
+                if include_audio:
+                    args += ['-map', '0:a']
+        else:
+            # Скорость 1.0 – просто маппим потоки без фильтров
+            args += ['-map', '0:v']
+            if include_audio:
+                args += ['-map', '0:a']
+            else:
+                args += ['-an']
+
+        # Кодек видео
+        args += ['-c:v', vcodec]
+        if vcodec == 'av1_nvenc':
+            args += ['-rc', 'vbr', '-cq', str(quality), '-b:v', '0']
+        else:
+            args += ['-rc', 'vbr', '-cq', str(quality), '-preset', preset]
+
+        # Целевой FPS
+        args += ['-r', str(target_fps)]
+
+        # Аудиокодек
+        if include_audio:
+            args += ['-c:a', 'aac']
+        else:
+            args += ['-an']
+
+        args.append(output_file)
+        return args
+
+    @staticmethod
+    def get_args_for_ffmpeg(list_path, output_file, speed, target_fps, vcodec, quality, preset,
+                            include_audio=True, encoding_enabled=True):
+        """
+        Основной метод – выбирает нужную стратегию и возвращает список аргументов.
+        """
+        if not encoding_enabled:
+            return VideoTools._build_concat_args(list_path, output_file, speed, include_audio)
+        else:
+            return VideoTools._build_encode_args(list_path, output_file, speed, target_fps,
+                                                 vcodec, quality, preset, include_audio)
 
 # ----------------- Поток обработки -----------------
 class EncodeWorker(QObject):
@@ -237,6 +393,27 @@ class EncodeWorker(QObject):
                     except subprocess.TimeoutExpired:
                         self._process.kill()
                         self._process.wait()
+
+    # ----------------- Форматирование времени -----------------
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0
+        total_secs = int(seconds)
+        hours, remainder = divmod(total_secs, 3600)
+        minutes, secs = divmod(remainder, 60)
+
+        parts = []
+        if hours > 0:
+            parts.append(f"{hours} ч")
+
+        if minutes > 0 or hours > 0:
+            parts.append(f"{minutes} мин")
+
+        if total_secs < 300 or not parts:
+            parts.append(f"{secs} сек")
+
+        return " ".join(parts)
 
     def run(self):
 
@@ -349,70 +526,9 @@ class EncodeWorker(QObject):
             else:
                 raw_files.sort()
 
-            # === Предварительная проверка целостности и предложение CHKDSK ===
-            broken_files = []
-
-            # Используем однопоточную проверку для определения битых файлов
-            for f in raw_files:
-                if self._is_canceled:
-                    self.finished.emit(False, "Отменено!")
-                    return
-                _, valid = get_video_info(f)
-                if not valid:
-                    broken_files.append(f)
-
-            if broken_files:
-                # Диалог запроса CHKDSK – показываем из рабочего потока,
-                # но с флагом WindowStaysOnTopHint, чтобы он был заметен.
-                msg = QMessageBox()
-                msg.setWindowTitle(f"{title} {ver}")
-                msg.setText(
-                    f"Найдено {len(broken_files)} повреждённых файлов.\n"
-                    "Возможна ошибка файловой системы.\n"
-                    "Запустить проверку диска (CHKDSK)?"
-                )
-                msg.setIcon(QMessageBox.Icon.Warning)
-                msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-                yes_btn = msg.addButton("Да", QMessageBox.ButtonRole.YesRole)
-                msg.exec()
-
-                if msg.clickedButton() == yes_btn:
-                    drives = set()
-                    for p in broken_files:
-                        drive = os.path.splitdrive(p)[0]
-                        if drive:
-                            drives.add(drive)
-                    for drive in drives:
-                        self.log.emit(f"Запуск CHKDSK {drive} /f ...", False)
-                        try:
-                            subprocess.run(
-                                ['chkdsk', drive, '/f'],
-                                check=False, timeout=300,
-                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                            )
-                        except Exception as e:
-                            self.log.emit(f"Ошибка CHKDSK: {e}", True)
-
-                    # Повторная проверка только тех файлов, что были битыми
-                    still_broken = []
-                    for f in broken_files:
-                        if self._is_canceled:
-                            self.finished.emit(False, "Отменено!")
-                            return
-                        _, valid2 = get_video_info(f)
-                        if valid2:
-                            self.log.emit(f"Файл исправлен после CHKDSK: {os.path.basename(f)}", False)
-                        else:
-                            still_broken.append(f)
-                    broken_files = still_broken
-                    if broken_files:
-                        self.log.emit(f"После CHKDSK остались повреждёнными: {len(broken_files)} файлов.", True)
-                else:
-                    self.log.emit("Проверка диска отменена. Битые файлы будут пропущены.", False)
-
             # === Проверка, все ли файлы 360° MP4 ===
             all_360 = all(
-                os.path.splitext(f)[1].lower() == '.mp4' and is_spherical_mp4(f)
+                os.path.splitext(f)[1].lower() == '.mp4' and VideoTools.is_spherical_mp4(f)
                 for f in raw_files
             )
 
@@ -439,7 +555,7 @@ class EncodeWorker(QObject):
                                   "Объединение будет выполнено без ускорения.", True)
                     self.speed = 1.0   # принудительно отключаем
 
-                mp4box = get_mp4box_path()
+                mp4box = VideoTools.get_mp4box_path()
                 if not mp4box:
                     self.finished.emit(False, "MP4Box не найден. Установите GPAC для объединения 360° видео. https://gpac.io/downloads/gpac-nightly-builds")
                     return
@@ -502,8 +618,8 @@ class EncodeWorker(QObject):
                 # Успех – заменяем выходной файл
                 os.replace(tmp_merged, self.output_file)
 
-                total_str = format_duration(time.time() - self._start_time)
-                encode_str = format_duration(time.time() - encode_start)
+                total_str = self.format_duration(time.time() - self._start_time)
+                encode_str = self.format_duration(time.time() - encode_start)
 
                 self.progress.emit(100.0)
                 self.finished.emit(True, f"Обработка 360° видео завершена за {total_str} (объединение {encode_str}).")
@@ -515,7 +631,6 @@ class EncodeWorker(QObject):
             total_src_duration = 0.0
             repaired_count = 0
             lock = threading.Lock()
-            concurrent_ffprobes = threading.Semaphore(4)
             total_to_check = len(raw_files)
             completed = 0
 
@@ -531,10 +646,7 @@ class EncodeWorker(QObject):
                 if self._is_canceled:
                     return None
 
-                with concurrent_ffprobes:
-                    if self._is_canceled:
-                        return None
-                    dur, valid = get_video_info(f)
+                dur, valid = VideoTools.get_video_info(f)
 
                 if valid:
                     with lock:
@@ -547,12 +659,13 @@ class EncodeWorker(QObject):
                     self.log.emit(f"Битый файл обнаружен: {os.path.basename(f)}", True)
                     # Восстановленный файл создаём во временной папке
                     tmp_repaired = os.path.join(temp_dir, os.path.basename(f) + ".repaired.mp4")
-                    with concurrent_ffprobes:
-                        repair_success = repair_video(f, tmp_repaired)
-                        if repair_success:
-                            dur2, valid2 = get_video_info(tmp_repaired)
-                        else:
-                            valid2 = False
+
+                    repair_success = VideoTools.repair_video(f, tmp_repaired)
+                    if repair_success:
+                        dur2, valid2 = VideoTools.get_video_info(tmp_repaired)
+                    else:
+                        valid2 = False
+
                     if valid2:
                         # Заменяем оригинальный путь восстановленным файлом (он останется во временной папке)
                         with lock:
@@ -606,16 +719,16 @@ class EncodeWorker(QObject):
 
             if self.encoding_enabled:
                 self.log.emit(
-                    f"Общая длительность исходных: {format_duration(total_src_duration)}, "
-                    f"после ускорения: {format_duration(effective_duration)}", False)
+                    f"Общая длительность исходных: {self.format_duration(total_src_duration)}, "
+                    f"после ускорения: {self.format_duration(effective_duration)}", False)
             else:
                 if self.speed != 1.0:
                     self.log.emit(
-                        f"Общая длительность исходных: {format_duration(total_src_duration)}, "
-                        f"после ускорения: {format_duration(effective_duration)}", False)
+                        f"Общая длительность исходных: {self.format_duration(total_src_duration)}, "
+                        f"после ускорения: {self.format_duration(effective_duration)}", False)
                 else:
                     self.log.emit(
-                        f"Общая длительность исходных: {format_duration(total_src_duration)}", False)
+                        f"Общая длительность исходных: {self.format_duration(total_src_duration)}", False)
 
             if self._is_canceled:
                 self.finished.emit(False, "Отменено!")
@@ -629,7 +742,7 @@ class EncodeWorker(QObject):
 
             try:
                 self.status.emit("Запуск кодирования...")
-                args = get_args_for_ffmpeg(
+                args = VideoTools.get_args_for_ffmpeg(
                     list_path, self.output_file, self.speed, self.target_fps,
                     self.vcodec, self.quality, self.preset, self.include_audio, self.encoding_enabled
                 )
@@ -700,8 +813,8 @@ class EncodeWorker(QObject):
                                         remaining_real = 0.0
                                     elapsed = now_real - encode_start
                                     self._last_eta_str = (
-                                        f"Осталось: {format_duration(remaining_real)} "
-                                        f"(прошло {format_duration(elapsed)})"
+                                        f"Осталось: {self.format_duration(remaining_real)} "
+                                        f"(прошло {self.format_duration(elapsed)})"
                                     )
                                     self.eta_update.emit(self._last_eta_str)
                                 else:
@@ -711,7 +824,7 @@ class EncodeWorker(QObject):
                                     self.eta_update.emit(self._last_eta_str)
                                 else:
                                     elapsed = now_real - encode_start
-                                    self.eta_update.emit(f"Осталось: ....  (прошло {format_duration(elapsed)})")
+                                    self.eta_update.emit(f"Осталось: ....  (прошло {self.format_duration(elapsed)})")
 
                     if 'Error' in line or 'Invalid' in line:
                         self._error_lines.append(line.strip())
@@ -732,8 +845,8 @@ class EncodeWorker(QObject):
 
                 encode_time = time.time() - encode_start
                 elapsed_total = time.time() - self._start_time
-                encode_str = format_duration(encode_time)
-                total_str = format_duration(elapsed_total)
+                encode_str = self.format_duration(encode_time)
+                total_str = self.format_duration(elapsed_total)
                 self.eta_update.emit("")
 
                 if self._is_canceled:
@@ -756,221 +869,23 @@ class EncodeWorker(QObject):
                 if os.path.exists(list_path):
                     os.unlink(list_path)
                 # Удаляем временную папку с восстановленными файлами
-                for temp_item in self._temp_files_to_clean:
-                    try:
-                        if os.path.isdir(temp_item):
-                            shutil.rmtree(temp_item, ignore_errors=True)
-                        elif os.path.isfile(temp_item):
-                            os.remove(temp_item)
-                    except Exception:
-                        pass
-                self._temp_files_to_clean.clear()
+                self._cleanup_temp_files() # очистка временных файлов
 
         except Exception as e:
             self.finished.emit(False, f"Ошибка: {str(e)}")
             # Даже при исключении пытаемся подчистить временные файлы
-            for temp_item in self._temp_files_to_clean:
-                try:
-                    if os.path.isdir(temp_item):
-                        shutil.rmtree(temp_item, ignore_errors=True)
-                    elif os.path.isfile(temp_item):
-                        os.remove(temp_item)
-                except Exception:
-                    pass
+            self._cleanup_temp_files() # очистка временных файлов
 
-def get_args_for_ffmpeg(list_path, output_file, speed, target_fps, vcodec, quality, preset, include_audio=True, encoding_enabled=True):
-    if not encoding_enabled:
-        args = ['ffmpeg']
-        if speed != 1.0:
-            args += ['-itsscale', str(1.0 / speed)]
-        args += ['-f', 'concat', '-safe', '0', '-i', list_path]
-        args += ['-c:v', 'copy']
-        if include_audio:
-            if speed != 1.0:
-                # При ускорении аудио перекодируем в AAC
-                args += ['-c:a', 'aac']
-                atempo_chain = []
-                s = speed
-                while s > 2.0:
-                    atempo_chain.append('atempo=2.0')
-                    s /= 2.0
-                while s < 0.5:
-                    atempo_chain.append('atempo=0.5')
-                    s /= 0.5
-                if s != 1.0:
-                    atempo_chain.append(f'atempo={s}')
-                filter_audio = ','.join(atempo_chain)
-                args += ['-filter:a', filter_audio]
-
-            else:
-                # Без ускорения просто копируем аудио
-                args += ['-c:a', 'copy']
-        else:
-            args += ['-an']
-
-        args += ['-y', output_file]
-        return args
-
-    # Режим с перекодировкой
-    all_videos = ffmpeg.input(list_path, format='concat', safe=0)
-    video = all_videos.video
-
-    fast_video = video.filter('setpts', f'{1/speed}*PTS')
-    fast_audio = None
-    if include_audio:
-        audio = all_videos.audio
-        fast_audio = audio
-        s = speed
-        while s > 2.0:
-            fast_audio = fast_audio.filter('atempo', 2.0)
-            s /= 2.0
-        while s < 0.5:
-            fast_audio = fast_audio.filter('atempo', 0.5)
-            s /= 0.5
-        if s != 1.0:
-            fast_audio = fast_audio.filter('atempo', s)
-
-    out_params = {
-        'vcodec': vcodec,
-        'r': str(target_fps),
-    }
-    if include_audio:
-        out_params['acodec'] = 'aac'
-
-    if vcodec == 'av1_nvenc':
-        out_params['rc'] = 'vbr'
-        out_params['cq'] = quality
-        out_params['b:v'] = '0'
-    else:
-        out_params['rc'] = 'vbr'
-        out_params['cq'] = quality
-        out_params['preset'] = preset
-
-    if include_audio:
-        out = ffmpeg.output(fast_video, fast_audio, output_file, **out_params)
-    else:
-        out = ffmpeg.output(fast_video, output_file, **out_params)
-
-    out = out.overwrite_output()
-    return out.get_args()
-
-
-# ----------------- Кастомные спинбоксы -----------------
-class SpinBox(QDoubleSpinBox):
-    def textFromValue(self, value):
-        if value == int(value):
-            return str(int(value))
-        else:
-            return f"{value:.2f}".rstrip('0').rstrip('.')
-
-    def validate(self, text: str, pos: int):
-        locale = self.locale()
-        decimal_point = locale.decimalPoint()
-        text = text.replace('.', decimal_point)
-        return super().validate(text, pos)
-
-    def valueFromText(self, text: str):
-        text = text.replace('.', self.locale().decimalPoint())
-        return super().valueFromText(text)
-
-
-# ----------------- Кастомная строка для выходного файла с Drag&Drop -----------------
-class DropLineEdit(QLineEdit):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.textChanged.connect(self._remove_quotes)
-
-    def _remove_quotes(self, text):
-        cleaned = text.replace('"', '').replace("'", '')
-        if cleaned != text:
-            cursor_pos = self.cursorPosition()
-            self.blockSignals(True)
-            self.setText(cleaned)
-            self.blockSignals(False)
-            self.setCursorPosition(min(cursor_pos, len(cleaned)))
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event: QDropEvent):
-        if event.mimeData().hasUrls():
-            url = event.mimeData().urls()[0].toLocalFile()
-            url = os.path.normpath(url)
-            self.setText(url)
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
-
-
-# ----------------- Кастомный список с D&D и Delete -----------------
-class FolderListWidget(QListWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event: QDropEvent):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                path = url.toLocalFile()
-                path = os.path.normpath(path)
-                if os.path.isdir(path) and not self._path_exists(path):
-                    self.addItem(path)
-                    if self.count() == 1:
-                        main_win = self._get_main_window()
-                        if main_win:
-                            main_win.try_read_last_number_from_folder()
-                elif os.path.isfile(path):
-                    ext = os.path.splitext(path)[1].lower()
-                    if ext in ('.mp4', '.ts', '.mov', '.avi', '.mkv', '.lrf', '.osv') and not self._path_exists(path):
-                        self.addItem(path)
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key.Key_Delete:
-            for item in self.selectedItems():
-                self.takeItem(self.row(item))
-        else:
-            super().keyPressEvent(event)
-
-    def _path_exists(self, path):
-        for i in range(self.count()):
-            if self.item(i).text() == path:
-                return True
-        return False
-
-    def _get_main_window(self):
-        p = self.parent()
-        while p is not None:
-            if isinstance(p, MainWindow):
-                return p
-            p = p.parent()
-        return None
-
+    def _cleanup_temp_files(self): # очистка временных файлов
+        for item in self._temp_files_to_clean:
+            try:
+                if os.path.isdir(item):
+                    shutil.rmtree(item, ignore_errors=True)
+                elif os.path.isfile(item):
+                    os.remove(item)
+            except Exception:
+                pass
+        self._temp_files_to_clean.clear()
 
 # ----------------- Главное окно -----------------
 class MainWindow(QMainWindow):
@@ -995,7 +910,7 @@ class MainWindow(QMainWindow):
         font.setPointSize(10)
         QApplication.instance().setFont(font)
 
-        self.log_text = QTextEdit()
+        self.log_text = RuTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         log_font = QFont("Courier New")
@@ -1014,7 +929,7 @@ class MainWindow(QMainWindow):
             ("h264_nvenc", "H.264"),
             ("av1_nvenc", "AV1")
         ]:
-            if check_encoder_support(codec_id):
+            if VideoTools.check_encoder_support(codec_id):
                 self.available_codecs.append(display)
                 self.available_codec_ids.append(codec_id)
 
@@ -1089,7 +1004,7 @@ class MainWindow(QMainWindow):
 
         num_line_layout = QHBoxLayout()
         num_line_layout.addWidget(self.sort_num_radio)
-        self.last_number_edit = QLineEdit()
+        self.last_number_edit = RuLineEdit()
         self.last_number_edit.setPlaceholderText("Введите №")
         self.last_number_edit.setFixedWidth(80)
         self.last_number_edit.setToolTip("Последний обработанный номер")
@@ -1100,7 +1015,7 @@ class MainWindow(QMainWindow):
         self.label_po = QLabel("по")
         num_line_layout.addWidget(self.label_po)
 
-        self.end_number_edit = QLineEdit()
+        self.end_number_edit = RuLineEdit()
         self.end_number_edit.setPlaceholderText("Введите №")
         self.end_number_edit.setFixedWidth(80)
         self.end_number_edit.setToolTip("Конечный обрабатываемый номер")
@@ -1128,8 +1043,7 @@ class MainWindow(QMainWindow):
 
         for path in self.saved_sources:
             path = os.path.normpath(path)
-            if os.path.exists(path):
-                self.folder_list.addItem(path)
+            self.folder_list.addItem(path)
         self._empty_hint_label.setVisible(self.folder_list.count() == 0)
 
         self.try_read_last_number_from_folder()
@@ -1175,7 +1089,7 @@ class MainWindow(QMainWindow):
         codec_layout.addWidget(self.codec_combo)
 
         codec_layout.addWidget(QLabel("Качество:"))
-        self.quality_spin = QSpinBox()
+        self.quality_spin = RuQSpinBox()
         self.quality_spin.setRange(1, 51)
         self.quality_spin.setValue(self.saved_quality)
         self.quality_spin.setFixedWidth(40)
@@ -1418,7 +1332,7 @@ class MainWindow(QMainWindow):
         self._worker.progress_verify.connect(self.on_progress_verify)
         self._worker.progress.connect(self.on_progress_update)
         self._worker.eta_update.connect(self.on_eta_update)
-        self._worker.status.connect(lambda msg: self.log_text.append(f"{time_stamp()} {msg}"))
+        self._worker.status.connect(lambda msg: self.log_text.append(f"{self.time_stamp()} {msg}"))
         self._worker.log.connect(self.append_log)
         self._worker.finished.connect(self.on_finished)
         self._worker.finished.connect(self._thread.quit)
@@ -1478,11 +1392,17 @@ class MainWindow(QMainWindow):
     def append_log(self, msg, is_error, show_time=True):
         self.log_text.setTextColor(QColor("red") if is_error else QColor("black"))
         if show_time:
-            self.log_text.append(f"{time_stamp()} {msg}")
+            self.log_text.append(f"{self.time_stamp()} {msg}")
         else:
             self.log_text.append(msg)
         if is_error:
             self.log_text.setTextColor(QColor("black"))
+
+    @staticmethod
+    def time_stamp() -> str:
+        """Возвращает текущее время в формате HHMMSS."""
+        t = time.localtime()
+        return f"{t.tm_hour:02d}{t.tm_min:02d}{t.tm_sec:02d}"
 
     def on_finished(self, success, msg):
         self._ignore_worker_signals = True   # блокируем сигналы от старого воркера
@@ -1559,63 +1479,179 @@ class MainWindow(QMainWindow):
         self.settings.setValue("dup_to_folder", int(self.dup_to_folder_check.isChecked()))
         super().closeEvent(event)
 
-# ---------- Очистка старого .old файла при запуске ----------
-def cleanup_old_backup():
-    """Удаляет предыдущий .old файл, оставшийся после обновления."""
-    old_path = sys.argv[0] + ".old"
-    if not os.path.exists(old_path):
-        return
-    try:
-        if send2trash:
-            send2trash.send2trash(old_path)
+# ----------------- Кастомный список с D&D и Delete -----------------
+class FolderListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
         else:
-            os.remove(old_path)
-    except Exception:
-        pass
+            super().dragEnterEvent(event)
 
-# Колбэк перезапуска после успешного обновления
-def do_restart(new_exe_path):
-    """Запускает новый исполняемый файл и завершает текущий процесс."""
-    launch_new_version(new_exe_path)
-    QTimer.singleShot(500, lambda: QApplication.quit())
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
 
-# ---------- Функция запуска новой версии после обновления ----------
-def launch_new_version(exe_path):
-    """Запускает переданный EXE-файл с очищенным окружением (без _MEI путей)."""
-    env = {}
-    for key in ('SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'PROGRAMDATA'):
-        if key in os.environ:
-            env[key] = os.environ[key]
-    path = os.environ.get('PATH', '')
-    clean_path = [p for p in path.split(os.pathsep) if '_MEI' not in p]
-    env['PATH'] = os.pathsep.join(clean_path)
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                path = os.path.normpath(path)
+                if os.path.isdir(path) and not self._path_exists(path):
+                    self.addItem(path)
+                    if self.count() == 1:
+                        main_win = self._get_main_window()
+                        if main_win:
+                            main_win.try_read_last_number_from_folder()
+                elif os.path.isfile(path):
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in ('.mp4', '.ts', '.mov', '.avi', '.mkv', '.lrf', '.osv') and not self._path_exists(path):
+                        self.addItem(path)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
-    subprocess.Popen(
-        [exe_path],
-        env=env,
-        creationflags=subprocess.DETACHED_PROCESS,
-        close_fds=True
-    )
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Delete:
+            for item in self.selectedItems():
+                self.takeItem(self.row(item))
+        else:
+            super().keyPressEvent(event)
 
-# ---------- Показ сообщения (с настраиваемым текстом) ----------
-def message(text="Ошибка!", timeout=4, parent=None):
+    def _path_exists(self, path):
+        for i in range(self.count()):
+            if self.item(i).text() == path:
+                return True
+        return False
 
-    """
-    Показывает модальное окно с предупреждением.
-    text – произвольный текст сообщения.
-    Если timeout > 0, окно автоматически закроется через указанное число секунд.
-    parent – родительский виджет (можно None).
-    """
-    msg = QMessageBox(parent)
-    msg.setWindowTitle(f"{title} {ver}")
-    msg.setText(text)
-    msg.setIcon(QMessageBox.Icon.Critical)
-    if os.path.exists(icon_path):
-        msg.setWindowIcon(QIcon(icon_path))
-    if timeout > 0:
-        QTimer.singleShot(timeout * 1000, msg.close)
-    msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-    msg.exec()
+    def _get_main_window(self):
+        p = self.parent()
+        while p is not None:
+            if isinstance(p, MainWindow):
+                return p
+            p = p.parent()
+        return None
+
+# ----------------- Переводит стандартное контекстное меню на русский -----------------
+def translate_context_menu(menu):
+    """Переводит стандартное контекстное меню на русский, сохраняя иконки и шорткаты."""
+    replacements = {
+        'Undo': 'Отменить',
+        'Redo': 'Повторить',
+        'Cut': 'Вырезать',
+        'Copy': 'Копировать',
+        'Paste': 'Вставить',
+        'Delete': 'Удалить',
+        'Select All': 'Выделить всё',
+        'Step up': 'Шаг вверх',
+        'Step down': 'Шаг вниз'
+    }
+    for action in menu.actions():
+        if action.isSeparator():
+            continue   # сепараторы не трогаем
+        text = action.text().replace('&', '')
+        for eng, rus in replacements.items():
+            if eng in text:
+                text = text.replace(eng, rus)
+                break
+        action.setText(text)
+
+# ----------------- Кастомная строка для выходного файла с Drag&Drop -----------------
+class DropLineEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.textChanged.connect(self._remove_quotes)
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        translate_context_menu(menu)
+        menu.exec(event.globalPos())
+
+    def _remove_quotes(self, text):
+        cleaned = text.replace('"', '').replace("'", '')
+        if cleaned != text:
+            cursor_pos = self.cursorPosition()
+            self.blockSignals(True)
+            self.setText(cleaned)
+            self.blockSignals(False)
+            self.setCursorPosition(min(cursor_pos, len(cleaned)))
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0].toLocalFile()
+            url = os.path.normpath(url)
+            self.setText(url)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+# --------------------------- Порядковые номера -------------------------
+class RuLineEdit(QLineEdit):
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        translate_context_menu(menu)
+        menu.exec(event.globalPos())
+
+# --------------------------- Ускорение и FPS ---------------------------
+class SpinBox(QDoubleSpinBox): # Ускорение и FPS
+
+    def contextMenuEvent(self, event):
+        line_edit = self.lineEdit()
+        menu = line_edit.createStandardContextMenu()
+        translate_context_menu(menu)
+        menu.exec(event.globalPos())
+
+    def textFromValue(self, value):
+        if value == int(value):
+            return str(int(value))
+        else:
+            return f"{value:.2f}".rstrip('0').rstrip('.')
+
+    def validate(self, text: str, pos: int):
+        locale = self.locale()
+        decimal_point = locale.decimalPoint()
+        text = text.replace('.', decimal_point)
+        return super().validate(text, pos)
+
+    def valueFromText(self, text: str):
+        text = text.replace('.', self.locale().decimalPoint())
+        return super().valueFromText(text)
+
+# --------------------------- Качество ---------------------------
+class RuQSpinBox(QSpinBox):
+    def contextMenuEvent(self, event):
+        line_edit = self.lineEdit()
+        menu = line_edit.createStandardContextMenu()
+        translate_context_menu(menu)
+        menu.exec(event.globalPos())
+
+# --------------------------- Лог ---------------------------
+class RuTextEdit(QTextEdit):
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        translate_context_menu(menu)
+        menu.exec(event.globalPos())
+
+#-------------------------------------------------------------------------------
 
 if __name__ == '__main__':
 
@@ -1624,7 +1660,7 @@ if __name__ == '__main__':
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 
     if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
-        message(
+        Application.message(
             "FFmpeg или FFprobe не найдены.\n\n"
             "Команда для Power Shell:\n"
             "\"winget install ffmpeg\"\n\n"
@@ -1639,10 +1675,10 @@ if __name__ == '__main__':
     update_thread = start_update_check(
         title, ver, window,
         log_callback=window.append_log,   # логирование в главное окно
-        on_restart=do_restart             # функция перезапуска
+        on_restart=Application.do_restart             # функция перезапуска
     )
 
     # Удаляем старый .old файл, оставшийся от предыдущего обновления
-    cleanup_old_backup()
+    Application.cleanup_old_backup()
 
     app.exec()
