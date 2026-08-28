@@ -7,7 +7,7 @@
 #-------------------------------------------------------------------------------
 
 title = "SpeedVideoJoiner"
-ver = "v26.08.0"
+ver = "v26.08.1"
 
 #------------------------------Импорт модулей-----------------------------------
 
@@ -56,6 +56,29 @@ class Application:
                 os.remove(old_path)
         except Exception:
             pass
+
+    @staticmethod
+    def cleanup_new_exe():
+        """Удаляет временный _new.exe файл, оставшийся после неудачного обновления."""
+        if not Application.is_exe():
+            return
+        current_exe = sys.argv[0]
+        dir_name = os.path.dirname(current_exe)
+        new_exe_path = os.path.join(dir_name, f"{title}_new.exe")
+        if os.path.exists(new_exe_path):
+            try:
+                if send2trash:
+                    send2trash.send2trash(new_exe_path)
+                else:
+                    os.remove(new_exe_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def is_exe():
+        """Проверяет, является ли текущий исполняемый файл .exe."""
+        target = os.path.abspath(sys.argv[0])
+        return os.path.splitext(target)[1].lower() == '.exe'
 
     @staticmethod
     def do_restart(new_exe_path):
@@ -1678,7 +1701,7 @@ if __name__ == '__main__':
         on_restart=Application.do_restart             # функция перезапуска
     )
 
-    # Удаляем старый .old файл, оставшийся от предыдущего обновления
-    Application.cleanup_old_backup()
+    Application.cleanup_old_backup() # Удаляем старый .old файл, оставшийся от предыдущего обновления
+    Application.cleanup_new_exe()    # Удаляем временный _new.exe, если остался после сбоя
 
     app.exec()
